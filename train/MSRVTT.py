@@ -8,7 +8,8 @@ class MSRVTT_val_dataset(data.Dataset):
     def __init__(self):
         self.total_len = 1000
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.clip, self.preprocess = clip.load("ViT-B/32", device=self.device)
+        self.pretrained_clip_path = 'model/pretrained_clip/ViT-B-32.pt'
+        self.clip, self.preprocess = clip.load(self.pretrained_clip_path, device=self.device)
 
     def __len__(self):
         return self.total_len
@@ -43,7 +44,8 @@ class MSRVTT_train_dataset(data.Dataset):
     def __init__(self):
         self.total_len = 9000
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.clip, self.preprocess = clip.load("ViT-B/32", device=self.device)
+        self.pretrained_clip_path = 'model/pretrained_clip/ViT-B-32.pt'
+        self.clip, self.preprocess = clip.load(self.pretrained_clip_path, device=self.device)
 
     def __len__(self):
         return self.total_len
