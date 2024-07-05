@@ -1,3 +1,4 @@
+from datetime import datetime
 import torch
 import model.HashNet as HashNet
 from train.MSRVTT import MSRVTT_train_dataset, MSRVTT_val_dataset
@@ -6,14 +7,15 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import StepLR
-from utils import get_plotter
 import numpy as np
 
 
 class CLIP4H:
     def __init__(self):
         self.epoch = 200
-        self.batch_size = 3
+        self.train_set = MSRVTT_train_dataset()
+        self.valid_set = MSRVTT_val_dataset()
+        self.batch_size = 16
         self.lr = 0.01
         self.lr_decay_epoch = 150
         self.lr_decay = 0.1
@@ -25,12 +27,22 @@ class CLIP4H:
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum,
                                          weight_decay=self.weight_decay)
         self.scheduler = StepLR(self.optimizer, self.lr_decay_epoch, self.lr_decay)
-        self.plotter = get_plotter("CLIP4H")
+
+        self.max_r1_i2t = 0
+        self.max_r1_t2i = 0
+        self.max_r5_i2t = 0
+        self.max_r5_t2i = 0
+        self.max_r10_i2t = 0
+        self.max_r10_t2i = 0
+        # MdR: median rank of GT videos
+        self.min_MdR_i2t = len(self.valid_set)
+        self.min_MdR_t2i = len(self.valid_set)
+        self.best_epoch = 0
+        self.checkpoint_dir = 'checkpoints/CLIP4H/MSRVTT'
+        self.qB_img = self.qB_txt = self.rB_img = self.rB_txt = None
 
     def train(self):
-        train_set = MSRVTT_train_dataset()
-        valid_set = MSRVTT_val_dataset()
-        train_loader = DataLoader(train_set, batch_size=self.batch_size)
+        train_loader = DataLoader(self.train_set, batch_size=self.batch_size)
         for epoch in range(self.epoch):
             for image_feature, text_feature in tqdm(train_loader):  # Fv and Ft
                 F_I = image_feature.to('cuda', dtype=torch.float32)
@@ -86,10 +98,77 @@ class CLIP4H:
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-
-            valid(epoch, valid_set, self.model, self.batch_size)
+            self.valid(epoch)
             self.scheduler.step()
-            self.plotter.next_epoch()
+
+    def valid(self, epoch):
+        #  1000 * bit_size
+        qB_img, qB_txt = rB_img, rB_txt = get_valid_codes(self.valid_set, self.model, self.batch_size)
+        gt_path = 'dataset/MSRVTT/ground_truth.txt'
+        gt = np.loadtxt(gt_path, dtype=int).reshape(1000, 1000)
+        gt = torch.tensor(gt).to('cuda')
+        r1_i2t = calc_recalls_topn(1, qB_img, rB_txt, gt)
+        r1_t2i = calc_recalls_topn(1, qB_txt, rB_img, gt)
+        r5_i2t = calc_recalls_topn(5, qB_img, rB_txt, gt)
+        r5_t2i = calc_recalls_topn(5, qB_txt, rB_img, gt)
+        r10_i2t = calc_recalls_topn(10, qB_img, rB_txt, gt)
+        r10_t2i = calc_recalls_topn(10, qB_txt, rB_img, gt)
+        # MdR: median rank of GT videos
+        MdR_i2t = calc_MdR(qB_img, rB_txt, gt)
+        MdR_t2i = calc_MdR(qB_txt, rB_img, gt)
+
+        if r1_i2t + r1_t2i + r5_i2t + r5_t2i + r10_i2t + r10_t2i - MdR_i2t - MdR_t2i >= \
+                self.max_r1_i2t + self.max_r1_t2i + self.max_r5_i2t + self.max_r5_t2i + self.max_r10_i2t + self.max_r10_t2i \
+                - self.min_MdR_i2t - self.min_MdR_t2i:
+            self.max_r1_i2t = r1_i2t
+            self.max_r1_t2i = r1_t2i
+            self.max_r5_i2t = r5_i2t
+            self.max_r5_t2i = r5_t2i
+            self.max_r10_i2t = r10_i2t
+            self.max_r10_t2i = r10_t2i
+            self.min_MdR_i2t = MdR_i2t
+            self.min_MdR_t2i = MdR_t2i
+            self.best_epoch = epoch
+            torch.save(self.model.state_dict(), self.checkpoint_dir + '/CLIP4H-' + str(self.bit_size) + '-HashNet' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + '.pth')
+            self.qB_img = qB_img.cpu()
+            self.qB_txt = qB_txt.cpu()
+            self.rB_img = rB_img.cpu()
+            self.rB_txt = rB_txt.cpu()
+        with open('log/log.txt', 'a') as f:
+            line = f'epoch: [{epoch + 1}/{self.epoch}], R@1(i2t): {r1_i2t:.4f}, R@1(t2i): {r1_t2i}, R@5(i2t): {r5_i2t}, R@5(t2i): {r5_t2i}, R@10(i2t): {r10_i2t}, R@10(t2i): {r10_t2i}, MdR(i2t): {MdR_i2t}, MdR(t2i): {MdR_t2i}\n' \
+                   f'best:  [{self.best_epoch + 1}/{self.epoch}], R@1(i2t): {self.max_r1_i2t:.4f}, R@1(t2i): {self.max_r1_t2i}, R@5(i2t): {self.max_r5_i2t}, R@5(t2i): {self.max_r5_t2i}, R@10(i2t): {self.max_r10_i2t}, R@10(t2i): {self.max_r10_t2i}, MdR(i2t): {self.min_MdR_i2t}, MdR(t2i): {self.min_MdR_t2i}\n'
+            f.write(line)
+
+
+def get_valid_codes(valid_set, HashNet_model, batch_size):
+    valid_loader = DataLoader(valid_set, batch_size=batch_size)
+    img_buffer = txt_buffer = torch.empty(len(valid_set), HashNet_model.bit_size, dtype=torch.float32)
+    img_buffer, txt_buffer = to_cuda(img_buffer, txt_buffer)
+    index = 0
+    for image_feature, text_feature in tqdm(valid_loader):  # Fv and Ft
+        F_I = image_feature.to('cuda', dtype=torch.float32)
+        F_T = text_feature.to('cuda', dtype=torch.float32)
+        hid_I, _ = HashNet_model(F_I)
+        hid_T, _ = HashNet_model(F_T)
+        for i in range(hid_I.shape[0]):
+            img_buffer[index + i] = hid_I.data[i]
+            txt_buffer[index + i] = hid_T.data[i]
+        index = index + hid_I.shape[0]
+    img_buffer = HashNet_model.get_B(img_buffer)
+    txt_buffer = HashNet_model.get_B(txt_buffer)
+    return img_buffer, txt_buffer
+
+
+def to_cuda(*args):
+    """
+    chagne all tensor from cpu tensor to cuda tensor
+    :param args: tensors or models
+    :return: the tensors or models in cuda by input order
+    """
+    cuda_args = []
+    for arg in args:
+        cuda_args.append(arg.cuda())
+    return cuda_args
 
 
 def dynamic_weighting(S):
@@ -111,44 +190,72 @@ def dynamic_weighting(S):
     return S
 
 
-def valid(epoch, valid_set, model, batch_size):
-    #  1000 * bit_size
-    query_B_img, query_B_txt = get_valid_codes(valid_set, model, batch_size)
-    retrieve_B_img, retrieve_B_txt = get_valid_codes(valid_set, model, batch_size)
-    gt_path = 'dataset/MSRVTT/ground_truth.txt'
-    gt = np.loadtxt(gt_path, dtype=int).reshape(1000, 1000)
+def calc_recalls_topn(n, qB, rB, gt):
+    # qB, rB: num_query * bit_size
+    num_query = qB.shape[0]
+    recalls = [0] * num_query
+    for i in range(num_query):
+        # qB[iter]'s hamm with every rB
+        # hamm: 1*num_query
+        hamm = calc_hammingDist(qB[i, :], rB)
+        _, ind = torch.sort(hamm)
+        ind.squeeze_()
+        #  found: the found right ones of iter
+        found = gt[ind]
+        # topn
+        found = found[:n, i]
 
-    return 1
+        # total: all right ones of iter
+        total = torch.nonzero(gt[i]).squeeze(1)
+
+        # recall = the found right ones / all right ones
+        # found[: n] topn
+        right = torch.nonzero(found).squeeze(1)
+        recalls[i] += (right.numel()/total.numel())
+    return sum(recalls) / len(recalls)
 
 
-def get_valid_codes(valid_set, HashNet_model, batch_size):
-    valid_loader = DataLoader(valid_set, batch_size=batch_size)
-    img_buffer = txt_buffer = torch.empty(len(valid_set), HashNet_model.bit_size, dtype=torch.float32)
-    img_buffer, txt_buffer = to_cuda(img_buffer, txt_buffer)
-    index = 0
-    for image_feature, text_feature in tqdm(valid_loader):  # Fv and Ft
-        F_I = image_feature.to('cuda', dtype=torch.float32)
-        F_T = text_feature.to('cuda', dtype=torch.float32)
-        hid_I, code_I = HashNet_model(F_I)
-        hid_T, code_T = HashNet_model(F_T)
-        img_buffer[index, :] = code_I.data
-        txt_buffer[index, :] = code_T.data
-        index = index + 1
-    return img_buffer, txt_buffer
+def calc_MdR(qB, rB, gt):
+    # qB, rB: 1000*bit_size
+    num_query = qB.shape[0]
+    mdr = []
+    for i in range(num_query):
+        # qB[iter]'s hamm with every rB
+        hamm = calc_hammingDist(qB[i, :], rB)
+        _, ind = torch.sort(hamm)
+        ind.squeeze_()
+        for rank in range(len(ind)):
+            # ind[i] is a right one, save its rank
+            if gt[i][ind[rank]] == 1:
+                mdr.append(rank)
+    median_rank = torch.tensor(mdr).median().item()
+    return median_rank + 1
 
 
-def to_cuda(*args):
-    """
-    chagne all tensor from cpu tensor to cuda tensor
-    :param args: tensors or models
-    :return: the tensors or models in cuda by input order
-    """
-    cuda_args = []
-    for arg in args:
-        cuda_args.append(arg.cuda())
-    return cuda_args
+def calc_hammingDist(B1, B2):
+    # B1: 1 * bit_size B2: 1000 * bit_size
+    # q = bit_size
+    q = B2.shape[1]
+    # bit_size - 1's num = 0's num = distH
+    if len(B1.shape) < 2:
+        B1 = B1.unsqueeze(0)
+    distH = q - B1.mm(B2.transpose(0, 1))
+    return distH
 
 
 def train():
     trainer = CLIP4H()
     trainer.train()
+
+
+def test():
+    qB = torch.randint(0, 2, (10, 10))
+    qB = qB.float() * 2 - 1
+    rB = qB
+    gt = torch.randint(0, 2, (10, 10))
+    indices = torch.arange(0, 10)
+    gt[indices, indices] = 1
+    recall1 = calc_recalls_topn(1, qB, rB, gt)
+    recall5 = calc_recalls_topn(5, qB, rB, gt)
+    recall10 = calc_recalls_topn(10, qB, rB, gt)
+    MdR = calc_MdR(qB, rB, gt)
